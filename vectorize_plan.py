@@ -2,13 +2,17 @@
 
 Install:  pip install pymupdf opencv-python-headless numpy scipy scikit-image ezdxf
 Run:      python vectorize_plan.py cleaned_blueprint.pdf 1 page1
-          -> page1.dxf, page1.svg (scan underlay + vectors), page1_overlay.png
+          -> page1.dxf, page1.svg (scan underlay + vectors), page1_overlay.png,
+             page1_text.json (where every line of text is), page1_text_removed.png
 
-Tuned on sheet 1 only. Lines are traced as found: they are not snapped to
-horizontal/vertical or joined at corners, and lettering, symbols and hatching
-are left as plain polylines (layer DETAIL), not read as text or objects.
+The lettering is found first and erased from the scan; the drawing that is left
+is traced into straight lines (snapped square when within 2.5 degrees of
+horizontal/vertical), arcs, and short lines attached to them. Anything else is
+treated as noise and dropped. The text is located and traced, not read, and
+lines are not joined at corners. Tuned on sheet 1.
 """
 import base64
+import json
 import sys
 from collections import defaultdict
 
@@ -29,9 +33,11 @@ LAYERS = {
   "HEAVY_LINES": (1, "#e00000", "thick straight lines: walls, borders"),
   "LINES": (5, "#0000e0", "thin straight lines: dimensions, edges"),
   "LINES_DASHED": (3, "#00a000", "dashed or broken straight lines"),
+  "LINES_SHORT": (150, "#5a78ff", "short straight lines attached to the drawing: symbols, ticks"),
   "ARCS": (4, "#00b8d4", "arcs and circles: door swings, symbols"),
-  "HEAVY_DETAIL": (6, "#d000d0", "thick curves and shapes"),
-  "DETAIL": (30, "#ff8c00", "lettering, symbols, free curves (not interpreted)"),
+  "TEXT": (6, "#c000c0", "lettering found as text (traced, not read)"),
+  "TEXT_BOX": (200, "#8a40ff", "a box around each line of text"),
+  "UNSURE": (8, "#a0a0a0", "curvy leftovers kept for review (hidden)"),
 }
 
 OFFSETS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
@@ -286,11 +292,12 @@ def bridge_dashes(strokes, explained, tol=3.0, gap=60.0, min_frag=4.0,
 
   Dash-dot centre lines come out of the scan as many tiny fragments with
   unreliable angles, so they are grouped by position (same x, or same y)
-  instead of by direction. Returns (lines, coverage, used): new line rows,
-  their inked fraction, and a mask of the strokes they absorbed.
+  instead of by direction. Returns (lines, coverage, span): new line rows,
+  their inked fraction, and for every stroke the length of the new line that
+  absorbed it (0 when none did).
   """
   new_lines, new_cover = [], []
-  used = np.zeros(len(strokes), bool)
+  span_of = np.zeros(len(strokes))
   centre = np.array([s[0].mean(axis=0) for s in strokes])
   for lat in (0, 1):  # 0: vertical lines (compare x), 1: horizontal (compare y)
     al = 1 - lat
@@ -341,41 +348,50 @@ def bridge_dashes(strokes, explained, tol=3.0, gap=60.0, min_frag=4.0,
               row = [p, a, p, b] if lat == 0 else [a, p, b, p]
               new_lines.append([*row, float(wid[ch].mean()), 0.0])
               new_cover.append(covered / span)
-              used[ids[ch]] = True
+              span_of[ids[ch]] = np.maximum(span_of[ids[ch]], span)
         cluster = []
       if k < len(order):
         cluster.append(k)
   return (np.array(new_lines, dtype=np.float64).reshape(-1, 6),
-          np.array(new_cover, dtype=np.float64), used)
+          np.array(new_cover, dtype=np.float64), span_of)
 
 
-def build_primitives(strokes, min_piece=12, min_line=60, gap=40.0,
-                     line_eps=2.5, poly_eps=1.2):
+def build_primitives(strokes, min_piece=12, min_line=60, gap=40.0, line_eps=2.5):
   """Splits strokes into straight lines, arcs and everything else.
 
   Straight pieces (even short dashes) are joined across gaps; a joined group
   that adds up to at least `min_line` px is a line. Strokes that fit a circle
-  (door swings, round symbols) become arcs. What is left (lettering, symbols,
-  free curves) stays as simplified polylines.
+  (door swings, round symbols) become arcs. What is left is `leftover`.
 
-  Returns (lines, coverage, arcs, polys). lines rows are [x1, y1, x2, y2,
-  width, heavy]; coverage is the inked fraction of each line (dashed or
-  broken lines are lower); arcs rows are [cx, cy, r, theta0, dtheta, width,
-  heavy] (angles in image coordinates, y down); polys are (points, closed,
-  width, heavy).
+  Returns a dict:
+    lines     rows [x1, y1, x2, y2, width, heavy]
+    coverage  inked fraction of each line (dashed or broken lines are lower)
+    arcs      rows [cx, cy, r, theta0, dtheta, width, heavy] (image angles, y down)
+    span      per stroke: length of the line or arc it became part of (0 if none)
+    leftover  ids of the strokes that are neither line nor arc
   """
   pieces, owner, arcs = [], [], []
   explained = np.zeros(len(strokes), bool)
+  span_of = np.zeros(len(strokes))
   for sid, (pts, closed, width, heavy) in enumerate(strokes):
-    coarse = simplify(pts, line_eps, closed)
-    curved = is_smooth_curve(coarse)
-    if path_length(pts) >= 30 and (closed or curved or chord_deviation(pts) >= 3.0):
+    total = path_length(pts)
+    if not closed:
+      chord = float(np.hypot(*(pts[-1] - pts[0])))
+      bow = chord_deviation(pts)
+      if bow <= max(2.5, min(8.0, 0.03 * chord)):  # straight, give or take hand wobble
+        if chord >= min_piece:
+          pieces.append([*pts[0], *pts[-1], width, heavy])
+          owner.append(sid)
+        continue
+    if total >= 30 and (closed or (bow >= 6.0 and bow >= 0.04 * chord)):  # a circle, or visibly bowed
       arc = as_arc(pts, closed)
       if arc is not None:
         arcs.append([*arc, width, heavy])
         explained[sid] = True
+        span_of[sid] = arc[2] * abs(arc[4])
         continue
-    if curved:
+    coarse = simplify(pts, line_eps, closed)
+    if is_smooth_curve(coarse):
       continue  # a free curve, not a chain of lines
     ring = np.vstack([coarse, coarse[:1]]) if closed else coarse
     straight = [(a, b) for a, b in zip(ring[:-1], ring[1:])
@@ -396,15 +412,182 @@ def build_primitives(strokes, min_piece=12, min_line=60, gap=40.0,
   piece_len = np.hypot(pieces[:, 2] - pieces[:, 0], pieces[:, 3] - pieces[:, 1])
   kept_len = np.bincount(owner, weights=piece_len * good[group_of], minlength=len(strokes))
   explained |= kept_len >= 0.6 * total
+  np.maximum.at(span_of, owner, np.where(good[group_of], span[group_of], 0.0))
 
-  extra, extra_coverage, used = bridge_dashes(strokes, explained)
-  explained |= used
-  polys = [(simplify(pts, poly_eps, closed), closed, width, heavy)
-           for sid, (pts, closed, width, heavy) in enumerate(strokes)
-           if not explained[sid] and total[sid] >= 4]
-  return (np.vstack([merged[good], extra]),
-          np.concatenate([coverage[good], extra_coverage]),
-          np.array(arcs, dtype=np.float64).reshape(-1, 7), polys)
+  extra, extra_coverage, extra_span = bridge_dashes(strokes, explained)
+  explained |= extra_span > 0
+  span_of = np.maximum(span_of, extra_span)
+  return {
+      "lines": np.vstack([merged[good], extra]),
+      "coverage": np.concatenate([coverage[good], extra_coverage]),
+      "arcs": np.array(arcs, dtype=np.float64).reshape(-1, 7),
+      "span": span_of,
+      "leftover": np.flatnonzero(~explained & (total >= 4)),
+  }
+
+
+def is_symbol_frame(pts, closed):
+  """A closed shape with a few long straight edges: diamond, triangle, box."""
+  if not closed:
+    return False
+  corners = simplify(pts, 2.5, True)
+  edges = np.hypot(*(corners - np.roll(corners, 1, axis=0)).T)
+  return bool(3 <= len(corners) <= 8 and edges.min() >= 15 and np.ptp(pts, axis=0).max() >= 20)
+
+
+def split_lines(group, strokes, axis, max_spread=22.0):
+  """Splits a blob that holds several text lines into one group per line.
+
+  Strokes are clustered by where their centres lie across the text direction
+  (`axis` 1: rows, for horizontal text; 0: columns, for rotated text), using
+  the smallest number of lines for which every line is only about one letter
+  tall. A few stray strokes (a dashed line crossing the text) get a cluster
+  of their own instead of stretching the real lines.
+  """
+  centre = np.array([strokes[i][0][:, axis].mean() for i in group])
+  for k in range(1, 7):
+    edges = np.quantile(centre, (np.arange(k) + 0.5) / k)
+    for _ in range(20):  # 1-D k-means
+      label = np.abs(centre[:, None] - edges[None, :]).argmin(axis=1)
+      new = np.array([centre[label == j].mean() if np.any(label == j) else edges[j] for j in range(k)])
+      if np.allclose(new, edges):
+        break
+      edges = new
+    spreads = [np.ptp(np.percentile(centre[label == j], [5, 95])) for j in range(k) if np.any(label == j)]
+    if max(spreads) <= max_spread:
+      break
+  return [group[label == j] for j in range(k) if np.any(label == j)]
+
+
+def find_text(strokes, span, arcs, shape, reach=17, max_extent=80.0, max_length=160.0):
+  """Finds lettering: lines of short strokes of lettering size.
+
+  Strokes that belong to a long line (span >= 100 px), heavy bands, callout
+  markers and anything inside a circle or marker are left alone. The rest are
+  drawn on a canvas and closed by `reach` px along the text direction
+  (horizontally for normal text, vertically for rotated text), which fuses the
+  letters of a line into one blob. Blobs that hold several lines are split.
+  A line is text when it holds enough letter-sized strokes that are densely
+  packed; long parallel strokes (hatching) and runs of dashes are not text.
+
+  Returns (is_text, boxes, lines): a bool per stroke, and for every line of
+  text its oriented box (4 x 2 array of corners) and the ids of its strokes.
+  """
+  n = len(strokes)
+  if n == 0:
+    return np.zeros(0, bool), [], []
+  extent = np.array([np.ptp(s[0], axis=0).max() for s in strokes])
+  length = np.array([path_length(s[0]) for s in strokes])
+  ok = np.array([not s[3] and not is_symbol_frame(s[0], s[1]) for s in strokes])
+  ok &= (span < 100) & (extent <= max_extent) & (length <= max_length)
+  symbol = np.zeros(shape, np.uint8)  # filled circles and frames: what is inside is not lettering
+  for cx, cy, r, _, sweep, _, _ in arcs:
+    if abs(sweep) >= 5.5 and r <= 80:
+      cv2.circle(symbol, (round(cx), round(cy)), round(r), 1, -1)
+  for pts, closed, _, _ in strokes:
+    if is_symbol_frame(pts, closed):
+      cv2.fillPoly(symbol, [np.round(simplify(pts, 2.5, True)).astype(np.int32)], 1)
+
+  # Callout markers (diamond, triangle, box) are small enclosed shapes with a few
+  # straight sides. A leader line attached to a corner splits their outline into
+  # several strokes, so find them as holes in the traced linework instead.
+  linework = np.zeros(shape, np.uint8)  # drawn thick enough to close the gaps at corners
+  for s in strokes:
+    cv2.polylines(linework, [np.round(s[0]).astype(np.int32)], False, 1, 7)
+  sides = np.zeros(shape, np.uint8)
+  contours, hierarchy = cv2.findContours(linework, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+  for k, contour in enumerate(contours if hierarchy is not None else []):
+    if hierarchy[0][k][3] >= 0 and 350 <= cv2.contourArea(contour) <= 8000:  # a hole
+      corners = cv2.approxPolyDP(contour, 2.0, True)
+      if 3 <= len(corners) <= 6 and cv2.isContourConvex(corners):
+        cv2.fillPoly(symbol, [corners], 1)
+        cv2.polylines(sides, [corners], True, 1, 9)
+  on_sides = np.array([sides[np.round(s[0][:, 1]).astype(int).clip(0, shape[0] - 1),
+                             np.round(s[0][:, 0]).astype(int).clip(0, shape[1] - 1)].mean() >= 0.7 for s in strokes])
+  ok &= ~on_sides
+  all_mid = np.round([s[0][len(s[0]) // 2] for s in strokes]).astype(int)
+  ok &= symbol[all_mid[:, 1], all_mid[:, 0]] == 0
+  ids = np.flatnonzero(ok)
+  canvas = np.zeros(shape, np.uint8)
+  for i in ids:
+    cv2.polylines(canvas, [np.round(strokes[i][0]).astype(np.int32)], False, 1, 3)
+  mid = all_mid[ids]
+
+  def lettering(group, horizontal):
+    """The oriented box if the strokes in `group` form a line of text, else None."""
+    big = group[extent[group] >= 5]
+    if len(big) < 3:
+      return None  # too few letter-sized strokes
+    pts = np.vstack([strokes[i][0] for i in group])
+    centres = np.array([strokes[i][0].mean(axis=0) for i in group])
+    size = float(np.median(extent[big]))
+    # robust size of the line: spread of the stroke centres plus one letter
+    along_axis, across_axis = (0, 1) if horizontal else (1, 0)
+    along = np.ptp(np.percentile(centres[:, along_axis], [5, 95])) + size
+    across = np.ptp(np.percentile(centres[:, across_axis], [5, 95])) + size
+    if not (8 <= across <= 95 and along >= 1.2 * across):
+      return None  # not the shape of a line of text
+    ink_length = length[group].sum()
+    if size > 55 or ink_length < 0.02 * along * across:
+      return None  # strokes too big for lettering, or too sparse
+    faint = np.median([strokes[i][2] for i in group]) < 1.3
+    if ink_length < 35 or (faint and ink_length < 55):
+      return None  # a few faint specks, not lettering
+    ln = length[big]
+    chord = np.array([strokes[i][0][-1] - strokes[i][0][0] for i in big])
+    angle = np.arctan2(chord[:, 1], chord[:, 0])
+    straight = np.hypot(*chord.T) >= 0.9 * ln
+    run = 0.0 if horizontal else np.pi / 2  # direction of the text line
+    parallel = np.abs(np.sin(angle - run)) <= np.sin(np.radians(15))
+    if np.mean(straight & parallel) >= 0.6:
+      return None  # a run of dashes
+    if len(big) >= 6 and np.median(ln) >= 25:  # many long parallel strokes: hatching
+      if abs(np.sum(ln / ln.sum() * np.exp(2j * angle))) > 0.8:
+        return None
+    # Lettering shows most of these together; dashes, hatching and symbol
+    # fragments only a few of them.
+    directions = np.histogram(np.mod(angle, np.pi), bins=6, range=(0, np.pi))[0] / len(big)
+    traits = [
+        np.std(extent[big]) / np.mean(extent[big]) <= 0.6,  # letters of similar size
+        np.mean(straight & parallel) <= 0.3,  # not a row of dashes
+        (directions >= 0.1).sum() >= min(3, len(big) - 1),  # strokes in several directions
+        np.mean(~straight) >= 0.25,  # curved strokes
+        len(group) / along * 100 >= 6,  # enough strokes for its length
+        length[group].sum() / (along * across) >= 0.04,  # dense enough
+    ]
+    if sum(traits) < 5:
+      return None
+    return cv2.boxPoints(cv2.minAreaRect(pts.astype(np.float32)))
+
+  is_text = np.zeros(n, bool)
+  boxes, members = [], []
+  for horizontal in (True, False):  # normal text, then rotated text
+    kw, kh = (2 * reach + 1, 1) if horizontal else (1, 2 * reach + 1)
+    closed = cv2.morphologyEx(canvas, cv2.MORPH_CLOSE, np.ones((kh, kw), np.uint8))
+    _, blob = cv2.connectedComponents(closed, connectivity=8)
+    blob_of = blob[mid[:, 1], mid[:, 0]]
+    order = np.argsort(blob_of, kind="stable")
+    for group in np.split(ids[order], np.flatnonzero(np.diff(blob_of[order])) + 1):
+      group = group[~is_text[group]]
+      if len(group) == 0:
+        continue
+      for line in split_lines(group, strokes, 1 if horizontal else 0):
+        box = lettering(line, horizontal)
+        if box is not None:
+          is_text[line] = True
+          boxes.append(box)
+          members.append(line)
+
+  # punctuation and stray marks beside a line of text belong to it
+  if boxes:
+    near = np.zeros(shape, np.uint8)
+    cv2.fillPoly(near, [np.round(b).astype(np.int32) for b in boxes], 1)
+    near = cv2.dilate(near, np.ones((9, 9), np.uint8))
+    small = np.flatnonzero(~is_text & ok & (extent <= 12))
+    centre = np.round([strokes[i][0][len(strokes[i][0]) // 2] for i in small]).astype(int)
+    if len(small):
+      is_text[small[near[centre[:, 1], centre[:, 0]] > 0]] = True
+  return is_text, boxes, members
 
 
 def arc_points(arc, step_deg=4.0):
@@ -463,23 +646,170 @@ def line_layer(heavy, coverage):
   return "HEAVY_LINES" if heavy else ("LINES_DASHED" if coverage < 0.8 else "LINES")
 
 
-def explained_share(ink, lines, arcs, polys):
-  """Share of the ink within a stroke's own half-width + 3 px of lines/arcs,
-  of detail polylines only, and of nothing."""
+def remove_text(ink, strokes, is_text):
+  """The scan with the lettering erased: what is left is the drawing."""
   mask = np.zeros(ink.shape, np.uint8)
-  for x1, y1, x2, y2, width, _ in lines:
-    cv2.line(mask, (round(x1), round(y1)), (round(x2), round(y2)), 1, int(max(7, width + 6)))
-  for arc in arcs:
-    cv2.polylines(mask, [np.round(arc_points(arc)).astype(np.int32)], False, 1, int(max(7, arc[5] + 6)))
-  on_lines = int((ink & (mask > 0)).sum())
-  for pts, closed, width, _ in polys:
-    cv2.polylines(mask, [np.round(pts).astype(np.int32)], closed, 1, int(max(7, width + 6)))
-  on_all = int((ink & (mask > 0)).sum())
+  for i in np.flatnonzero(is_text):
+    pts, closed, width, _ = strokes[i]
+    cv2.polylines(mask, [np.round(pts).astype(np.int32)], closed, 1, int(width) + 4)
+  return ink & ~(mask > 0)
+
+
+def tidy_leftover(strokes, prims, min_keep=40, near=4.0, min_piece=12):
+  """Keeps what is straight, drops what is noise.
+
+  Strokes that are neither lines nor arcs become short straight lines when they
+  are mostly straight and part of the drawing: long enough, touching a line or
+  an arc, or a closed frame. Isolated short bits are noise and are dropped.
+  Curvy leftovers are kept apart, in `unsure`, only when they are long.
+
+  Returns (short, unsure, dropped): short-line rows [x1, y1, x2, y2, width,
+  heavy], ids of the unsure strokes, and the number of strokes dropped.
+  """
+  parts = []
+  for x1, y1, x2, y2, _, _ in prims["lines"]:
+    k = max(2, int(np.hypot(x2 - x1, y2 - y1) / 4))
+    parts.append(np.stack([np.linspace(x1, x2, k), np.linspace(y1, y2, k)], axis=1))
+  parts += [arc_points(arc, 3.0) for arc in prims["arcs"]]
+  parts += [s[0][::3] for s in strokes if s[3]]
+  tree = cKDTree(np.vstack(parts) if parts else np.full((1, 2), -1e9))
+  short, unsure, dropped = [], [], 0
+  for sid in prims["leftover"]:
+    pts, closed, width, heavy = strokes[sid]
+    total = path_length(pts)
+    coarse = simplify(pts, 2.0, closed)
+    ring = np.vstack([coarse, coarse[:1]]) if closed else coarse
+    pieces = [(a, b) for a, b in zip(ring[:-1], ring[1:]) if np.hypot(*(b - a)) >= min_piece]
+    if pieces and sum(np.hypot(*(b - a)) for a, b in pieces) >= 0.6 * total:
+      attached = min(tree.query([p for ab in pieces for p in ab])[0]) <= near
+      if total >= min_keep or attached or is_symbol_frame(pts, closed):
+        short += [[*a, *b, width, heavy] for a, b in pieces]
+      else:
+        dropped += 1
+    elif total >= 60:
+      unsure.append(sid)
+    else:
+      dropped += 1
+  return np.array(short, dtype=np.float64).reshape(-1, 6), unsure, dropped
+
+
+def inside_boxes(boxes, shape, grow=0):
+  """A mask of the oriented boxes, grown by `grow` px."""
+  mask = np.zeros(shape, np.uint8)
+  if boxes:
+    cv2.fillPoly(mask, [np.round(b).astype(np.int32) for b in boxes], 1)
+  if grow:
+    mask = cv2.dilate(mask, np.ones((2 * grow + 1, 2 * grow + 1), np.uint8))
+  return mask > 0
+
+
+def new_boxes(boxes, found, shape, overlap=0.6):
+  """The boxes in `found` that are not mostly covered by the ones in `boxes`."""
+  covered = inside_boxes(boxes, shape)
+  kept = []
+  for box in found:
+    x, y, w, h = cv2.boundingRect(np.round(box).astype(np.int32))
+    x0, y0, x1, y1 = max(x, 0), max(y, 0), min(x + w, shape[1]), min(y + h, shape[0])
+    local = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(local, [np.round(box - [x, y]).astype(np.int32)], 1)
+    area = int(local.sum())
+    inside = int((covered[y0:y1, x0:x1] & (local[y0 - y:y1 - y, x0 - x:x1 - x] > 0)).sum()) if x1 > x0 and y1 > y0 else 0
+    if area == 0 or inside < overlap * area:
+      kept.append(box)
+  return kept
+
+
+def snap_square(lines, tol_deg=1.0):
+  """Makes lines that are within `tol_deg` of horizontal or vertical exactly so."""
+  lines = lines.copy()
+  if len(lines) == 0:
+    return lines
+  dx, dy = lines[:, 2] - lines[:, 0], lines[:, 3] - lines[:, 1]
+  angle = np.degrees(np.arctan2(np.abs(dy), np.abs(dx)))  # 0 = horizontal, 90 = vertical
+  flat, upright = angle <= tol_deg, angle >= 90 - tol_deg
+  lines[flat, 1] = lines[flat, 3] = (lines[flat, 1] + lines[flat, 3]) / 2
+  lines[upright, 0] = lines[upright, 2] = (lines[upright, 0] + lines[upright, 2]) / 2
+  return lines
+
+
+def vectorize(ink, snap_deg=2.5):
+  """Text first, then the drawing.
+
+  Finds the lettering, erases it from the scan, traces what is left (looking
+  once more for lettering that the first pass could not see) and keeps only
+  straight lines, arcs and short lines attached to them. Returns a dict with
+  the lines, arcs, text and a few counts.
+  """
+  strokes = find_strokes(ink)
+  first = build_primitives(strokes)
+  is_text, boxes, _ = find_text(strokes, first["span"], first["arcs"], ink.shape)
+  text = [strokes[i] for i in np.flatnonzero(is_text)]
+  drawing = remove_text(ink, strokes, is_text)
+
+  # round two, on the drawing without lettering: lines that were not real no
+  # longer shield the letters they were built from
+  clean = find_strokes(drawing)
+  second = build_primitives(clean)
+  is_text2, boxes2, _ = find_text(clean, second["span"], second["arcs"], ink.shape)
+  text += [clean[i] for i in np.flatnonzero(is_text2)]
+  boxes += new_boxes(boxes, boxes2, ink.shape)
+  drawing = remove_text(drawing, clean, is_text2)
+  clean = [s for s, t in zip(clean, is_text2) if not t]
+
+  prims = build_primitives(clean)
+  short, unsure, dropped = tidy_leftover(clean, prims)
+
+  # small bits of the drawing do not lie inside a line of text; long lines can
+  # (an underline), and with the lettering erased they are real
+  in_text = inside_boxes(boxes, ink.shape, grow=3)
+
+  def mid_in_text(rows):
+    x = np.clip(np.round((rows[:, 0] + rows[:, 2]) / 2).astype(int), 0, ink.shape[1] - 1)
+    y = np.clip(np.round((rows[:, 1] + rows[:, 3]) / 2).astype(int), 0, ink.shape[0] - 1)
+    return in_text[y, x]
+
+  lines, coverage = prims["lines"], prims["coverage"]
+  short = short[~mid_in_text(short)] if len(short) else short
+
+  def arc_in_text(arc):  # is the middle of the arc inside a line of text?
+    t = arc[3] + arc[4] / 2
+    x = int(np.clip(round(arc[0] + arc[2] * np.cos(t)), 0, ink.shape[1] - 1))
+    y = int(np.clip(round(arc[1] + arc[2] * np.sin(t)), 0, ink.shape[0] - 1))
+    return in_text[y, x]
+
+  arcs = np.array([a for a in prims["arcs"] if not arc_in_text(a)], dtype=np.float64).reshape(-1, 7)
+  return {
+      "lines": snap_square(lines, snap_deg),
+      "coverage": coverage,
+      "short": snap_square(short, snap_deg),
+      "arcs": arcs,
+      "text": [(simplify(s[0], 1.2, s[1]), s[1], s[2]) for s in text],
+      "boxes": boxes,
+      "unsure": [(simplify(clean[i][0], 1.2, clean[i][1]), clean[i][1], clean[i][2], clean[i][3])
+                 for i in unsure],
+      "dropped": dropped,
+      "drawing": drawing,
+  }
+
+
+def ink_shares(ink, result):
+  """Share of the ink within a stroke's half-width + 3 px of the drawing
+  (lines, arcs), of the text, and of nothing."""
+  drawing = np.zeros(ink.shape, np.uint8)
+  for x1, y1, x2, y2, width, _ in np.vstack([result["lines"], result["short"]]):
+    cv2.line(drawing, (round(x1), round(y1)), (round(x2), round(y2)), 1, int(max(7, width + 6)))
+  for arc in result["arcs"]:
+    cv2.polylines(drawing, [np.round(arc_points(arc)).astype(np.int32)], False, 1, int(max(7, arc[5] + 6)))
+  text = np.zeros(ink.shape, np.uint8)
+  for pts, closed, width in result["text"]:
+    cv2.polylines(text, [np.round(pts).astype(np.int32)], closed, 1, int(max(7, width + 6)))
   n = int(ink.sum())
-  return on_lines / n, (on_all - on_lines) / n, (n - on_all) / n
+  on_drawing = int((ink & (drawing > 0)).sum())
+  on_text = int((ink & (drawing == 0) & (text > 0)).sum())
+  return on_drawing / n, on_text / n, (n - on_drawing - on_text) / n
 
 
-def write_dxf(path, height, in_per_px, lines, coverage, arcs, polys):
+def write_dxf(path, height, in_per_px, result):
   """DXF in real-world inches (y up), one layer per kind of primitive."""
   doc = ezdxf.new("R2010", setup=True)
   doc.units = ezdxf.units.IN
@@ -487,6 +817,7 @@ def write_dxf(path, height, in_per_px, lines, coverage, arcs, polys):
   for name, (colour, _, _) in LAYERS.items():
     doc.layers.add(name, color=colour)
   doc.layers.get("LINES_DASHED").dxf.linetype = "DASHED"
+  doc.layers.get("UNSURE").off()
   msp = doc.modelspace()
 
   def pt(x, y):
@@ -495,10 +826,13 @@ def write_dxf(path, height, in_per_px, lines, coverage, arcs, polys):
   def weight(width_px, dpi=200):  # nearest standard plot weight, 1/100 mm
     return min(const.VALID_DXF_LINEWEIGHTS, key=lambda v: abs(v - width_px * 2540 / dpi))
 
-  for (x1, y1, x2, y2, width, heavy), cov in zip(lines, coverage):
+  for (x1, y1, x2, y2, width, heavy), cov in zip(result["lines"], result["coverage"]):
     msp.add_line(pt(x1, y1), pt(x2, y2), dxfattribs={
         "layer": line_layer(heavy, cov), "lineweight": weight(width)})
-  for cx, cy, r, theta0, sweep, width, heavy in arcs:
+  for x1, y1, x2, y2, width, heavy in result["short"]:
+    msp.add_line(pt(x1, y1), pt(x2, y2), dxfattribs={
+        "layer": "LINES_SHORT", "lineweight": weight(width)})
+  for cx, cy, r, theta0, sweep, width, heavy in result["arcs"]:
     attribs = {"layer": "ARCS", "lineweight": weight(width)}
     centre = pt(cx, cy)
     if abs(sweep) >= 2 * np.pi - 0.01:
@@ -509,14 +843,18 @@ def write_dxf(path, height, in_per_px, lines, coverage, arcs, polys):
     start, end = (first, last) if sweep < 0 else (last, first)
     msp.add_arc(centre, r * in_per_px, np.degrees(start) % 360, np.degrees(end) % 360,
                 dxfattribs=attribs)
-  for pts, closed, width, heavy in polys:
+  for pts, closed, width in result["text"]:
     msp.add_lwpolyline([pt(x, y) for x, y in pts], close=closed, dxfattribs={
-        "layer": "HEAVY_DETAIL" if heavy else "DETAIL", "lineweight": weight(width)})
+        "layer": "TEXT", "lineweight": weight(width)})
+  for box in result["boxes"]:
+    msp.add_lwpolyline([pt(x, y) for x, y in box], close=True, dxfattribs={"layer": "TEXT_BOX"})
+  for pts, closed, width, heavy in result["unsure"]:
+    msp.add_lwpolyline([pt(x, y) for x, y in pts], close=closed, dxfattribs={"layer": "UNSURE"})
   doc.saveas(path)
 
 
-def write_svg(path, ink, lines, coverage, arcs, polys):
-  """SVG in scan pixels: the cleaned scan as a faded underlay plus a group per layer."""
+def write_svg(path, ink, result):
+  """SVG in scan pixels: the scan as a faded underlay plus a group per layer."""
   height, width = ink.shape
   png = cv2.imencode(".png", np.where(ink, 0, 255).astype(np.uint8))[1].tobytes()
   groups = {name: [] for name in LAYERS}
@@ -524,14 +862,21 @@ def write_svg(path, ink, lines, coverage, arcs, polys):
   def points(pts):
     return " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
 
-  for (x1, y1, x2, y2, _, heavy), cov in zip(lines, coverage):
-    groups[line_layer(heavy, cov)].append(
-        f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
-  for arc in arcs:
+  def line(x1, y1, x2, y2):
+    return f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>'
+
+  for (x1, y1, x2, y2, _, heavy), cov in zip(result["lines"], result["coverage"]):
+    groups[line_layer(heavy, cov)].append(line(x1, y1, x2, y2))
+  for x1, y1, x2, y2, _, _ in result["short"]:
+    groups["LINES_SHORT"].append(line(x1, y1, x2, y2))
+  for arc in result["arcs"]:
     groups["ARCS"].append(f'<polyline points="{points(arc_points(arc))}"/>')
-  for pts, closed, _, heavy in polys:
-    tag = "polygon" if closed else "polyline"
-    groups["HEAVY_DETAIL" if heavy else "DETAIL"].append(f'<{tag} points="{points(pts)}"/>')
+  for pts, closed, _ in result["text"]:
+    groups["TEXT"].append(f'<{"polygon" if closed else "polyline"} points="{points(pts)}"/>')
+  for box in result["boxes"]:
+    groups["TEXT_BOX"].append(f'<polygon points="{points(box)}"/>')
+  for pts, closed, _, _ in result["unsure"]:
+    groups["UNSURE"].append(f'<{"polygon" if closed else "polyline"} points="{points(pts)}"/>')
 
   out = [
       f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
@@ -542,7 +887,8 @@ def write_svg(path, ink, lines, coverage, arcs, polys):
   ]
   for name, items in groups.items():
     stroke = "2.5" if name == "HEAVY_LINES" else "1.2"
-    out.append(f'<g id="{name}" class="v" stroke="{LAYERS[name][1]}" stroke-width="{stroke}">')
+    hidden = ' display="none"' if name == "UNSURE" else ""
+    out.append(f'<g id="{name}" class="v" stroke="{LAYERS[name][1]}" stroke-width="{stroke}"{hidden}>')
     out += items
     out.append("</g>")
   out.append("</svg>")
@@ -550,7 +896,33 @@ def write_svg(path, ink, lines, coverage, arcs, polys):
     f.write("\n".join(out))
 
 
-def draw_layers(vis, lines, coverage, arcs, polys, scale=1.0, origin=(0, 0), heavy_px=3):
+def write_text_index(path, height, in_per_px, boxes):
+  """A list of every line of text found: where it is, how big, which way it runs.
+
+  Positions are in real-world inches (y up), the same frame as the DXF; angle
+  is the direction of the line of text, counter-clockwise from the x axis.
+  """
+  entries = []
+  for k, box in enumerate(boxes):
+    sides = np.roll(box, -1, axis=0) - box
+    lengths = np.hypot(*sides.T)
+    edge = sides[int(np.argmax(lengths[:2]))]
+    angle = float(np.degrees(np.arctan2(-edge[1], edge[0])) % 180)  # image y points down
+    corners = [[round(float(x * in_per_px), 2), round(float((height - y) * in_per_px), 2)] for x, y in box]
+    entries.append({
+        "id": k,
+        "centre_in": [round(float(box[:, 0].mean() * in_per_px), 2),
+                      round(float((height - box[:, 1].mean()) * in_per_px), 2)],
+        "length_in": round(float(lengths[:2].max() * in_per_px), 2),
+        "height_in": round(float(lengths[:2].min() * in_per_px), 2),
+        "angle_deg": round(angle, 1),
+        "corners_in": corners,
+    })
+  with open(path, "w") as f:
+    json.dump({"units": "inches at drawing scale, y up", "text_lines": entries}, f, indent=1)
+
+
+def draw_layers(vis, result, scale=1.0, origin=(0, 0), heavy_px=3):
   """Draws every primitive in its layer colour (BGR) onto `vis`."""
   def bgr(layer):
     h = LAYERS[layer][1]
@@ -559,25 +931,31 @@ def draw_layers(vis, lines, coverage, arcs, polys, scale=1.0, origin=(0, 0), hea
   def pix(pts):
     return np.round((np.asarray(pts) - origin) * scale).astype(np.int32)
 
-  for pts, closed, _, heavy in polys:
-    cv2.polylines(vis, [pix(pts)], closed, bgr("HEAVY_DETAIL" if heavy else "DETAIL"), 1, cv2.LINE_AA)
-  for arc in arcs:
+  for pts, closed, _ in result["text"]:
+    cv2.polylines(vis, [pix(pts)], closed, bgr("TEXT"), 1, cv2.LINE_AA)
+  for box in result["boxes"]:
+    cv2.polylines(vis, [pix(box)], True, bgr("TEXT_BOX"), 1, cv2.LINE_AA)
+  for arc in result["arcs"]:
     cv2.polylines(vis, [pix(arc_points(arc))], False, bgr("ARCS"), 2, cv2.LINE_AA)
-  for (x1, y1, x2, y2, _, heavy), cov in zip(lines, coverage):
+  for x1, y1, x2, y2, _, _ in result["short"]:
     a, b = pix([[x1, y1], [x2, y2]])
-    layer = line_layer(heavy, cov)
-    cv2.line(vis, tuple(a), tuple(b), bgr(layer), heavy_px if heavy else 2, cv2.LINE_AA)
+    cv2.line(vis, tuple(a), tuple(b), bgr("LINES_SHORT"), 1, cv2.LINE_AA)
+  for (x1, y1, x2, y2, _, heavy), cov in zip(result["lines"], result["coverage"]):
+    a, b = pix([[x1, y1], [x2, y2]])
+    cv2.line(vis, tuple(a), tuple(b), bgr(line_layer(heavy, cov)), heavy_px if heavy else 2, cv2.LINE_AA)
   return vis
 
 
-def write_overlay(path, ink, lines, coverage, arcs, polys, scale=0.5):
+def write_overlay(path, ink, result, scale=0.5):
   """Whole-page preview: faded scan with the vectors on top and a legend."""
   gray = cv2.resize(np.where(ink, 0, 255).astype(np.uint8), None, fx=scale, fy=scale,
                     interpolation=cv2.INTER_AREA)
   vis = cv2.cvtColor((255 - (255 - gray) * 0.45).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-  draw_layers(vis, lines, coverage, arcs, polys, scale)
-  y = vis.shape[0] - 24 * len(LAYERS) - 30
-  for name, (_, hexcol, text) in LAYERS.items():
+  draw_layers(vis, result, scale)
+  shown = [name for name in LAYERS if name != "UNSURE"]
+  y = vis.shape[0] - 24 * len(shown) - 30
+  for name in shown:
+    _, hexcol, text = LAYERS[name]
     col = (int(hexcol[5:7], 16), int(hexcol[3:5], 16), int(hexcol[1:3], 16))
     cv2.line(vis, (40, y - 6), (90, y - 6), col, 4)
     cv2.putText(vis, f"{name}: {text}", (104, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (40, 40, 40), 1, cv2.LINE_AA)
@@ -590,20 +968,22 @@ def main(pdf_path, page_no, prefix):
   in_per_px = DRAWING_SCALE / dpi
   print(f"Page {page_no}: {ink.shape[1]}x{ink.shape[0]} px at {dpi:.0f} DPI "
         f"(1 px = {in_per_px:.3f} in at 1/4\" = 1'-0\")")
-  strokes = find_strokes(ink)
-  lines, coverage, arcs, polys = build_primitives(strokes)
+  result = vectorize(ink)
+  lines, coverage = result["lines"], result["coverage"]
   heavy = lines[:, 5] > 0
   dashed = ~heavy & (coverage < 0.8)
-  print(f"{len(strokes):,} strokes -> {int(heavy.sum())} heavy lines, "
-        f"{int((~heavy & ~dashed).sum())} thin lines, {int(dashed.sum())} dashed/broken lines, "
-        f"{len(arcs)} arcs, {len(polys):,} detail polylines")
-  on_lines, on_detail, rest = explained_share(ink, lines, arcs, polys)
-  print(f"Ink explained by lines and arcs: {100 * on_lines:.1f}%, only by detail polylines: "
-        f"{100 * on_detail:.1f}%, by nothing: {100 * rest:.1f}%")
-  write_dxf(f"{prefix}.dxf", ink.shape[0], in_per_px, lines, coverage, arcs, polys)
-  write_svg(f"{prefix}.svg", ink, lines, coverage, arcs, polys)
-  write_overlay(f"{prefix}_overlay.png", ink, lines, coverage, arcs, polys)
-  print(f"Saved {prefix}.dxf, {prefix}.svg, {prefix}_overlay.png")
+  print(f"Text: {len(result['boxes'])} lines of lettering ({len(result['text']):,} strokes) taken out of the drawing")
+  print(f"Drawing: {int(heavy.sum())} heavy lines, {int((~heavy & ~dashed).sum())} thin lines, "
+        f"{int(dashed.sum())} dashed/broken lines, {len(result['short'])} short lines, {len(result['arcs'])} arcs")
+  print(f"Dropped as noise: {result['dropped']:,} bits; kept aside as unsure: {len(result['unsure'])}")
+  on_drawing, on_text, rest = ink_shares(ink, result)
+  print(f"Ink: {100 * on_drawing:.1f}% in the drawing, {100 * on_text:.1f}% in text, {100 * rest:.1f}% left over")
+  write_dxf(f"{prefix}.dxf", ink.shape[0], in_per_px, result)
+  write_svg(f"{prefix}.svg", ink, result)
+  write_overlay(f"{prefix}_overlay.png", ink, result)
+  write_text_index(f"{prefix}_text.json", ink.shape[0], in_per_px, result["boxes"])
+  cv2.imwrite(f"{prefix}_text_removed.png", np.where(result["drawing"], 0, 255).astype(np.uint8))
+  print(f"Saved {prefix}.dxf, {prefix}.svg, {prefix}_overlay.png, {prefix}_text.json, {prefix}_text_removed.png")
 
 
 if __name__ == "__main__":
