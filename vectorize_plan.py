@@ -7,19 +7,23 @@ Run:      python vectorize_plan.py cleaned_blueprint.pdf 1 page1
 
 The lettering is found first and erased from the scan; the drawing that is left
 is traced into straight lines (snapped square when within 2.5 degrees of
-horizontal/vertical), arcs, and short lines attached to them. Anything else is
-treated as noise and dropped. The text is located and traced, not read, and
-lines are not joined at corners. Tuned on sheet 1.
+horizontal/vertical), arcs, and short lines attached to them. Lines that meet at
+a corner or a T are joined: their ends move onto the point where they cross.
+Anything else is treated as noise and dropped. The text is located and traced,
+not read. Tuned on sheet 1.
 """
 import base64
 import json
+import math
 import sys
 from collections import defaultdict
+from xml.sax.saxutils import escape
 
 import cv2
 import ezdxf
 import numpy as np
 import pymupdf  # PyMuPDF
+from ezdxf.enums import TextEntityAlignment
 from ezdxf.lldxf import const
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
@@ -38,7 +42,14 @@ LAYERS = {
   "TEXT": (6, "#c000c0", "lettering found as text (traced, not read)"),
   "TEXT_BOX": (200, "#8a40ff", "a box around each line of text"),
   "UNSURE": (8, "#a0a0a0", "curvy leftovers kept for review (hidden)"),
+  "SYMBOLS": (40, "#b06000", "marker symbols (diamond, triangle, circle with a letter), traced"),
+  "TEXT_TRACED": (252, "#d8a0d8", "strokes behind the typed text below (hidden)"),
+  "TEXT_DIM": (1, "#d00000", "dimension strings typed from the lettering: check them against the plan"),
+  "TEXT_NOTE": (7, "#202020", "notes, room names, door and window tags, title block: typed from the lettering"),
+  "TEXT_CHECK": (30, "#e07000", "typed text that was hard to read: check it against the plan"),
 }
+HIDDEN_LAYERS = ("UNSURE", "TEXT_TRACED")
+TEXT_LAYERS = ("TEXT_DIM", "TEXT_NOTE", "TEXT_CHECK")
 
 OFFSETS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 
@@ -72,6 +83,8 @@ def trace_skeleton(skel, spur_len=10):
   Returns a list of (points, closed): points is an (n, 2) float array of
   (x, y) pixel coordinates, closed marks a loop with no junction.
   """
+  if not skel.any():
+    return []
   pad = np.pad(skel, 1)
   ys, xs = np.nonzero(pad)
   idx = np.full(pad.shape, -1, np.int32)
@@ -655,12 +668,14 @@ def remove_text(ink, strokes, is_text):
   return ink & ~(mask > 0)
 
 
-def tidy_leftover(strokes, prims, min_keep=40, near=4.0, min_piece=12):
+def tidy_leftover(strokes, prims, min_keep=40, near=4.0, min_piece=12, through=False):
   """Keeps what is straight, drops what is noise.
 
   Strokes that are neither lines nor arcs become short straight lines when they
   are mostly straight and part of the drawing: long enough, touching a line or
   an arc, or a closed frame. Isolated short bits are noise and are dropped.
+  With `through`, a bold piece also counts as touching when it crosses a line
+  (a dimension tick), not only when its ends reach one.
   Curvy leftovers are kept apart, in `unsure`, only when they are long.
 
   Returns (short, unsure, dropped): short-line rows [x1, y1, x2, y2, width,
@@ -681,7 +696,10 @@ def tidy_leftover(strokes, prims, min_keep=40, near=4.0, min_piece=12):
     ring = np.vstack([coarse, coarse[:1]]) if closed else coarse
     pieces = [(a, b) for a, b in zip(ring[:-1], ring[1:]) if np.hypot(*(b - a)) >= min_piece]
     if pieces and sum(np.hypot(*(b - a)) for a, b in pieces) >= 0.6 * total:
-      attached = min(tree.query([p for ab in pieces for p in ab])[0]) <= near
+      probes = [p for ab in pieces for p in ab]
+      if through and width >= 3.5:
+        probes += [a + (b - a) * f for a, b in pieces for f in (0.25, 0.5, 0.75)]
+      attached = min(tree.query(probes)[0]) <= near
       if total >= min_keep or attached or is_symbol_frame(pts, closed):
         short += [[*a, *b, width, heavy] for a, b in pieces]
       else:
@@ -732,13 +750,123 @@ def snap_square(lines, tol_deg=1.0):
   return lines
 
 
-def vectorize(ink, snap_deg=2.5):
-  """Text first, then the drawing.
+def cross2(a, b):
+  return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
-  Finds the lettering, erases it from the scan, traces what is left (looking
-  once more for lettering that the first pass could not see) and keeps only
-  straight lines, arcs and short lines attached to them. Returns a dict with
-  the lines, arcs, text and a few counts.
+
+def join_corners(lines, short, coverage, tol=10.0, heavy_tol=12.0, min_angle=25.0, min_move=0.75):
+  """Makes lines that meet at a corner or a T share the exact point.
+
+  Drawn lines stop short of each other or run past. For every line end this
+  looks for the line it should meet: one that is not parallel and whose
+  extension passes within `tol` px of the end. When two ends point at each
+  other's lines (an L corner) both move to the point where the lines cross;
+  when an end comes up to the middle of a line (a T) it moves onto that line.
+  Gaps are closed and overshoots trimmed, except that dashed lines are only
+  extended (extension lines are meant to run past what they dimension).
+  Walls (heavy lines) join only walls, since their lines are centerlines and a
+  thin line that stops at the face of a wall should stay there; dashed lines
+  are never a target. Ends move along their own line, so a line that was
+  square stays square.
+
+  Returns (lines, short, stats): the same rows with the ends moved, and the
+  number of corners, tees, extensions and trims made.
+  """
+  rows = np.vstack([lines, short])
+  n = len(rows)
+  stats = {"corners": 0, "tees": 0, "extended": 0, "trimmed": 0, "moved_px": 0.0}
+  if n < 2:
+    return lines, short, stats
+  kind = np.concatenate([np.where(lines[:, 5] > 0, 0, np.where(coverage < 0.8, 2, 1)),
+                         np.full(len(short), 3)])  # heavy, solid, dashed, short
+  can_join = np.array([[1, 0, 0, 0], [0, 1, 0, 1], [0, 1, 1, 1], [0, 1, 0, 1]], bool)  # [from, to]
+  p, q = rows[:, :2], rows[:, 2:4]
+  length = np.hypot(*(q - p).T)
+  u = (q - p) / np.maximum(length, 1e-9)[:, None]
+  ends = np.stack([p, q], axis=1).reshape(-1, 2)   # end 2i starts line i, end 2i + 1 finishes it
+  away = np.stack([-u, u], axis=1).reshape(-1, 2)  # pointing out of the line at each end
+  owner = np.repeat(np.arange(n), 2)
+
+  # for each end e and line j: the end reaches line j by moving s along its own
+  # line (+ extends, - trims), at distance t along j from j's start
+  found = []
+  for lo in range(0, 2 * n, 500):
+    e = np.arange(lo, min(lo + 500, 2 * n))
+    a = away[e][:, None, :]
+    rel = p[None, :, :] - ends[e][:, None, :]
+    den = cross2(a, u[None, :, :])
+    with np.errstate(divide="ignore", invalid="ignore"):
+      s = cross2(rel, u[None, :, :]) / den
+      t = cross2(rel, a) / den
+    src = kind[owner[e]]
+    reach = np.where(src == 0, heavy_tol, tol)[:, None]
+    ok = (np.abs(den) >= np.sin(np.radians(min_angle))) & can_join[src][:, kind]
+    ok &= owner[e][:, None] != np.arange(n)[None, :]
+    ok &= (np.abs(s) <= reach) & (t >= -reach) & (t <= length[None, :] + reach)
+    ok &= ~((s < 0) & (src == 2)[:, None])  # dashed lines are extended, never trimmed
+    ei, ji = np.nonzero(ok)
+    found.append(np.stack([e[ei], ji, s[ei, ji], t[ei, ji]], axis=1))
+  found = np.vstack(found)
+
+  # an L corner moves both ends, a T only the end that arrives; closest first
+  cand = []
+  for e, j, s, t in found:
+    e, j = int(e), int(j)
+    i = owner[e]
+    reach = heavy_tol if kind[i] == 0 else tol
+    near_start = t < length[j] / 2
+    ej = 2 * j + (0 if near_start else 1)
+    sj = -t if near_start else t - length[j]
+    corner = abs(sj) <= reach and not (sj < 0 and kind[j] == 2)
+    if corner and not can_join[kind[j], kind[i]]:
+      corner = False
+      if not 0 <= t <= length[j]:
+        continue
+    if not corner and not 0 <= t <= length[j]:
+      continue
+    cand.append((abs(s) + (abs(sj) if corner else 0.0), e, ej if corner else -1, s, sj))
+  cand.sort(key=lambda c: c[0])
+
+  taken = np.zeros(2 * n, bool)
+  target = ends.copy()
+  push = np.zeros(2 * n)  # signed move along the line, to count extensions and trims
+  joins = []
+
+  def fits(e, point):  # a line may not collapse or turn around
+    i = e // 2
+    a, b = (target[2 * i], point) if e % 2 else (point, target[2 * i + 1])
+    v = b - a
+    return float(np.hypot(*v)) >= max(3.0, 0.5 * length[i]) and float(v @ (q[i] - p[i])) > 0
+
+  for _, e, ej, s, sj in cand:
+    point = ends[e] + away[e] * s
+    if taken[e] or (ej >= 0 and taken[ej]) or not fits(e, point) or (ej >= 0 and not fits(ej, point)):
+      continue
+    target[e], push[e], taken[e] = point, s, True
+    if ej >= 0:
+      target[ej], push[ej], taken[ej] = point, sj, True
+    joins.append((e, ej))
+
+  moved = taken & (np.hypot(*(target - ends).T) > min_move)
+  stats["extended"] = int((moved & (push > 0)).sum())
+  stats["trimmed"] = int((moved & (push < 0)).sum())
+  stats["moved_px"] = float(np.hypot(*(target - ends).T)[moved].sum())
+  stats["corners"] = sum(1 for e, ej in joins if ej >= 0 and (moved[e] or moved[ej]))
+  stats["tees"] = sum(1 for e, ej in joins if ej < 0 and moved[e])
+
+  new = target.reshape(n, 2, 2)
+  rows = rows.copy()
+  rows[:, :2], rows[:, 2:4] = new[:, 0], new[:, 1]
+  return rows[:len(lines)], rows[len(lines):], stats
+
+
+def find_lettering(ink):
+  """Finds the lines of lettering and erases them from the scan.
+
+  Looks twice: the second time on the drawing without lettering, where lines
+  that were not real no longer shield the letters they were built from.
+  Returns (text, boxes, drawing): the lettering as strokes, an oriented box
+  around each line of it, and the scan with the lettering erased.
   """
   strokes = find_strokes(ink)
   first = build_primitives(strokes)
@@ -746,26 +874,29 @@ def vectorize(ink, snap_deg=2.5):
   text = [strokes[i] for i in np.flatnonzero(is_text)]
   drawing = remove_text(ink, strokes, is_text)
 
-  # round two, on the drawing without lettering: lines that were not real no
-  # longer shield the letters they were built from
   clean = find_strokes(drawing)
   second = build_primitives(clean)
   is_text2, boxes2, _ = find_text(clean, second["span"], second["arcs"], ink.shape)
   text += [clean[i] for i in np.flatnonzero(is_text2)]
   boxes += new_boxes(boxes, boxes2, ink.shape)
-  drawing = remove_text(drawing, clean, is_text2)
-  clean = [s for s, t in zip(clean, is_text2) if not t]
+  return text, boxes, remove_text(drawing, clean, is_text2)
 
+
+def trace_drawing(drawing, boxes, snap_deg=2.5, join_tol=10.0):
+  """Traces the scan without its lettering into straight lines, arcs and
+  short lines attached to them, joined at corners (`join_tol` px, 0 to skip).
+  `boxes` are the lines of lettering that were taken out."""
+  clean = find_strokes(drawing)
   prims = build_primitives(clean)
   short, unsure, dropped = tidy_leftover(clean, prims)
 
   # small bits of the drawing do not lie inside a line of text; long lines can
   # (an underline), and with the lettering erased they are real
-  in_text = inside_boxes(boxes, ink.shape, grow=3)
+  in_text = inside_boxes(boxes, drawing.shape, grow=3)
 
   def mid_in_text(rows):
-    x = np.clip(np.round((rows[:, 0] + rows[:, 2]) / 2).astype(int), 0, ink.shape[1] - 1)
-    y = np.clip(np.round((rows[:, 1] + rows[:, 3]) / 2).astype(int), 0, ink.shape[0] - 1)
+    x = np.clip(np.round((rows[:, 0] + rows[:, 2]) / 2).astype(int), 0, drawing.shape[1] - 1)
+    y = np.clip(np.round((rows[:, 1] + rows[:, 3]) / 2).astype(int), 0, drawing.shape[0] - 1)
     return in_text[y, x]
 
   lines, coverage = prims["lines"], prims["coverage"]
@@ -773,23 +904,41 @@ def vectorize(ink, snap_deg=2.5):
 
   def arc_in_text(arc):  # is the middle of the arc inside a line of text?
     t = arc[3] + arc[4] / 2
-    x = int(np.clip(round(arc[0] + arc[2] * np.cos(t)), 0, ink.shape[1] - 1))
-    y = int(np.clip(round(arc[1] + arc[2] * np.sin(t)), 0, ink.shape[0] - 1))
+    x = int(np.clip(round(arc[0] + arc[2] * np.cos(t)), 0, drawing.shape[1] - 1))
+    y = int(np.clip(round(arc[1] + arc[2] * np.sin(t)), 0, drawing.shape[0] - 1))
     return in_text[y, x]
 
   arcs = np.array([a for a in prims["arcs"] if not arc_in_text(a)], dtype=np.float64).reshape(-1, 7)
+  lines, short = snap_square(lines, snap_deg), snap_square(short, snap_deg)
+  joins = {}
+  if join_tol and len(lines) + len(short) > 1:
+    lines, short, joins = join_corners(lines, short, coverage, join_tol, join_tol * 1.2)
   return {
-      "lines": snap_square(lines, snap_deg),
+      "lines": lines,
       "coverage": coverage,
-      "short": snap_square(short, snap_deg),
+      "short": short,
+      "joins": joins,
       "arcs": arcs,
-      "text": [(simplify(s[0], 1.2, s[1]), s[1], s[2]) for s in text],
-      "boxes": boxes,
       "unsure": [(simplify(clean[i][0], 1.2, clean[i][1]), clean[i][1], clean[i][2], clean[i][3])
                  for i in unsure],
       "dropped": dropped,
-      "drawing": drawing,
   }
+
+
+def vectorize(ink, snap_deg=2.5, join_tol=10.0):
+  """Text first, then the drawing.
+
+  Finds the lettering, erases it from the scan, and traces what is left.
+  Returns a dict with the lines, arcs, text and a few counts.
+  """
+  text, boxes, drawing = find_lettering(ink)
+  result = trace_drawing(drawing, boxes, snap_deg, join_tol)
+  result.update({
+      "text": [(simplify(s[0], 1.2, s[1]), s[1], s[2]) for s in text],
+      "boxes": boxes,
+      "drawing": drawing,
+  })
+  return result
 
 
 def ink_shares(ink, result):
@@ -809,15 +958,20 @@ def ink_shares(ink, result):
   return on_drawing / n, on_text / n, (n - on_drawing - on_text) / n
 
 
-def write_dxf(path, height, in_per_px, result):
-  """DXF in real-world inches (y up), one layer per kind of primitive."""
+def write_dxf(path, height, in_per_px, result, labels=()):
+  """DXF in real-world inches (y up), one layer per kind of primitive.
+
+  `labels` are typed text: dicts with the text, its layer, the two ends of its
+  baseline and its height, all in scan pixels.
+  """
   doc = ezdxf.new("R2010", setup=True)
   doc.units = ezdxf.units.IN
   doc.header["$LTSCALE"] = 24  # dash pattern sized for a building, not a part
   for name, (colour, _, _) in LAYERS.items():
     doc.layers.add(name, color=colour)
   doc.layers.get("LINES_DASHED").dxf.linetype = "DASHED"
-  doc.layers.get("UNSURE").off()
+  for name in set(HIDDEN_LAYERS) | ({"TEXT_BOX"} if labels else set()):  # boxes only matter until the text is typed
+    doc.layers.get(name).off()
   msp = doc.modelspace()
 
   def pt(x, y):
@@ -843,17 +997,25 @@ def write_dxf(path, height, in_per_px, result):
     start, end = (first, last) if sweep < 0 else (last, first)
     msp.add_arc(centre, r * in_per_px, np.degrees(start) % 360, np.degrees(end) % 360,
                 dxfattribs=attribs)
-  for pts, closed, width in result["text"]:
+  text_layer = result.get("text_layer") or ["TEXT"] * len(result["text"])
+  for (pts, closed, width), layer in zip(result["text"], text_layer):
     msp.add_lwpolyline([pt(x, y) for x, y in pts], close=closed, dxfattribs={
-        "layer": "TEXT", "lineweight": weight(width)})
+        "layer": layer, "lineweight": weight(width)})
+  for pts, closed, width in result.get("symbols", []):
+    msp.add_lwpolyline([pt(x, y) for x, y in pts], close=closed, dxfattribs={
+        "layer": "SYMBOLS", "lineweight": weight(width)})
   for box in result["boxes"]:
     msp.add_lwpolyline([pt(x, y) for x, y in box], close=True, dxfattribs={"layer": "TEXT_BOX"})
+  for lab in labels:
+    (x1, y1), (x2, y2) = lab["base"]
+    msp.add_text(lab["text"], height=lab["height"] * in_per_px, dxfattribs={"layer": lab["layer"]}
+                 ).set_placement(pt(x1, y1), pt(x2, y2), align=TextEntityAlignment.FIT)
   for pts, closed, width, heavy in result["unsure"]:
     msp.add_lwpolyline([pt(x, y) for x, y in pts], close=closed, dxfattribs={"layer": "UNSURE"})
   doc.saveas(path)
 
 
-def write_svg(path, ink, result):
+def write_svg(path, ink, result, labels=()):
   """SVG in scan pixels: the scan as a faded underlay plus a group per layer."""
   height, width = ink.shape
   png = cv2.imencode(".png", np.where(ink, 0, 255).astype(np.uint8))[1].tobytes()
@@ -871,8 +1033,17 @@ def write_svg(path, ink, result):
     groups["LINES_SHORT"].append(line(x1, y1, x2, y2))
   for arc in result["arcs"]:
     groups["ARCS"].append(f'<polyline points="{points(arc_points(arc))}"/>')
-  for pts, closed, _ in result["text"]:
-    groups["TEXT"].append(f'<{"polygon" if closed else "polyline"} points="{points(pts)}"/>')
+  text_layer = result.get("text_layer") or ["TEXT"] * len(result["text"])
+  for (pts, closed, _), layer in zip(result["text"], text_layer):
+    groups[layer].append(f'<{"polygon" if closed else "polyline"} points="{points(pts)}"/>')
+  for pts, closed, _ in result.get("symbols", []):
+    groups["SYMBOLS"].append(f'<{"polygon" if closed else "polyline"} points="{points(pts)}"/>')
+  for lab in labels:
+    (x1, y1), (x2, y2) = lab["base"]
+    groups[lab["layer"]].append(
+        f'<text transform="translate({x1:.1f},{y1:.1f}) rotate({math.degrees(math.atan2(y2 - y1, x2 - x1)):.2f})" '
+        f'font-size="{lab["height"]:.1f}" textLength="{math.hypot(x2 - x1, y2 - y1):.1f}" '
+        f'lengthAdjust="spacingAndGlyphs">{escape(lab["text"])}</text>')
   for box in result["boxes"]:
     groups["TEXT_BOX"].append(f'<polygon points="{points(box)}"/>')
   for pts, closed, _, _ in result["unsure"]:
@@ -885,10 +1056,14 @@ def write_svg(path, ink, result):
       f'<g id="scan" opacity="0.35"><image width="{width}" height="{height}" '
       f'xlink:href="data:image/png;base64,{base64.b64encode(png).decode()}"/></g>',
   ]
+  hidden_layers = set(HIDDEN_LAYERS) | ({"TEXT_BOX"} if labels else set())
   for name, items in groups.items():
-    stroke = "2.5" if name == "HEAVY_LINES" else "1.2"
-    hidden = ' display="none"' if name == "UNSURE" else ""
-    out.append(f'<g id="{name}" class="v" stroke="{LAYERS[name][1]}" stroke-width="{stroke}"{hidden}>')
+    hidden = ' display="none"' if name in hidden_layers else ""
+    if name in TEXT_LAYERS:
+      out.append(f'<g id="{name}" fill="{LAYERS[name][1]}" font-family="Arial, Helvetica, sans-serif"{hidden}>')
+    else:
+      stroke = "2.5" if name == "HEAVY_LINES" else "1.2"
+      out.append(f'<g id="{name}" class="v" stroke="{LAYERS[name][1]}" stroke-width="{stroke}"{hidden}>')
     out += items
     out.append("</g>")
   out.append("</svg>")
@@ -933,6 +1108,8 @@ def draw_layers(vis, result, scale=1.0, origin=(0, 0), heavy_px=3):
 
   for pts, closed, _ in result["text"]:
     cv2.polylines(vis, [pix(pts)], closed, bgr("TEXT"), 1, cv2.LINE_AA)
+  for pts, closed, _ in result.get("symbols", []):
+    cv2.polylines(vis, [pix(pts)], closed, bgr("SYMBOLS"), 1, cv2.LINE_AA)
   for box in result["boxes"]:
     cv2.polylines(vis, [pix(box)], True, bgr("TEXT_BOX"), 1, cv2.LINE_AA)
   for arc in result["arcs"]:
@@ -952,7 +1129,8 @@ def write_overlay(path, ink, result, scale=0.5):
                     interpolation=cv2.INTER_AREA)
   vis = cv2.cvtColor((255 - (255 - gray) * 0.45).astype(np.uint8), cv2.COLOR_GRAY2BGR)
   draw_layers(vis, result, scale)
-  shown = [name for name in LAYERS if name != "UNSURE"]
+  shown = [name for name in LAYERS if name not in HIDDEN_LAYERS and name not in TEXT_LAYERS
+           and (name != "SYMBOLS" or result.get("symbols"))]
   y = vis.shape[0] - 24 * len(shown) - 30
   for name in shown:
     _, hexcol, text = LAYERS[name]
@@ -975,6 +1153,10 @@ def main(pdf_path, page_no, prefix):
   print(f"Text: {len(result['boxes'])} lines of lettering ({len(result['text']):,} strokes) taken out of the drawing")
   print(f"Drawing: {int(heavy.sum())} heavy lines, {int((~heavy & ~dashed).sum())} thin lines, "
         f"{int(dashed.sum())} dashed/broken lines, {len(result['short'])} short lines, {len(result['arcs'])} arcs")
+  j = result["joins"]
+  if j:
+    print(f"Joined: {j['corners']} corners and {j['tees']} T-junctions "
+          f"({j['extended']} line ends extended, {j['trimmed']} trimmed back)")
   print(f"Dropped as noise: {result['dropped']:,} bits; kept aside as unsure: {len(result['unsure'])}")
   on_drawing, on_text, rest = ink_shares(ink, result)
   print(f"Ink: {100 * on_drawing:.1f}% in the drawing, {100 * on_text:.1f}% in text, {100 * rest:.1f}% left over")
