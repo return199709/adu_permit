@@ -24,6 +24,7 @@ import csv
 import hashlib
 import json
 import sys
+import textwrap
 
 import cv2
 import numpy as np
@@ -140,10 +141,11 @@ def write_check_sheets(prefix, ink, boxes, entries, ids, name, page_height=1800)
   for i in order:
     e = entries[i]
     crop = crop_around(gray, boxes[i], 120, 40, 2.0, limit=660)
-    head = np.full((58, max(crop.shape[1], 330), 3), 255, np.uint8)
+    said = textwrap.wrap(f"read as: {e['conf']}" + (f" | {e['note']}" if e.get("note") else ""), 80)[:3]
+    head = np.full((40 + 18 * len(said), max(crop.shape[1], 330), 3), 255, np.uint8)
     cv2.putText(head, f"#{i}   {e['text']}", (6, 30), cv2.FONT_HERSHEY_DUPLEX, 0.95, (0, 0, 170), 1, cv2.LINE_AA)
-    cv2.putText(head, f"read as: {e['conf']}" + (f" - {e['note']}" if e.get("note") else ""), (6, 52),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 60), 1, cv2.LINE_AA)
+    for k, row in enumerate(said):
+      cv2.putText(head, row, (6, 52 + 18 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 60), 1, cv2.LINE_AA)
     card = np.full((head.shape[0] + crop.shape[0] + 8, head.shape[1], 3), 255, np.uint8)
     card[:head.shape[0]] = head
     card[head.shape[0]:head.shape[0] + crop.shape[0], :crop.shape[1]] = crop
@@ -212,13 +214,27 @@ def main(pdf_path, page_no, prefix, transcription_path):
   # sort the strokes of the lettering by what turned out to be there; what was
   # not lettering gets its ink back before the drawing is traced
   owners = stroke_owners(boxes, text, ink.shape)
-  back = np.zeros(ink.shape, np.uint8)
+  not_lettering = np.zeros(ink.shape, np.uint8)
   for stroke, o in zip(text, owners):
     if kind(o) == "NOTTEXT":
-      cv2.polylines(back, [np.round(stroke[0]).astype(np.int32)], stroke[1], 1, int(stroke[2]) + 4)
-  drawing = drawing | (ink & (back > 0))
+      cv2.polylines(not_lettering, [np.round(stroke[0]).astype(np.int32)], stroke[1], 1, int(stroke[2]) + 4)
+  drawing = drawing | (ink & (not_lettering > 0))
   result = vp.trace_drawing(drawing, [b for i, b in enumerate(boxes) if kind(i) != "NOTTEXT"])
-  keep = [k for k, o in enumerate(owners) if kind(o) not in ("NOTTEXT", "SYM")]
+
+  # nothing may vanish: a stroke that was called "not lettering" but did not become a line or an
+  # arc stays visible as a traced stroke (it may be lettering the finder cut up)
+  covered = np.zeros(ink.shape, np.uint8)
+  for x1, y1, x2, y2, *_ in np.vstack([result["lines"], result["short"]]):
+    cv2.line(covered, (round(x1), round(y1)), (round(x2), round(y2)), 1, 7)
+  for arc in result["arcs"]:
+    cv2.polylines(covered, [np.round(vp.arc_points(arc)).astype(np.int32)], False, 1, 7)
+
+  def in_drawing(stroke):
+    pts = np.round(stroke[0]).astype(int)
+    return covered[pts[:, 1].clip(0, ink.shape[0] - 1), pts[:, 0].clip(0, ink.shape[1] - 1)].mean() >= 0.6
+
+  kept_apart = [k for k, o in enumerate(owners) if kind(o) == "NOTTEXT" and not in_drawing(text[k])]
+  keep = [k for k, o in enumerate(owners) if kind(o) not in ("NOTTEXT", "SYM")] + kept_apart
   simple = lambda s: (vp.simplify(s[0], 1.2, s[1]), s[1], s[2])
   result.update({
       "text": [simple(text[k]) for k in keep],
@@ -241,8 +257,10 @@ def main(pdf_path, page_no, prefix, transcription_path):
          and (e["conf"] == "low" or "?" in e["text"])]
   sheets += write_check_sheets(prefix, ink, boxes, entries, low, "text_check")
   joins = result["joins"]
-  print(f"Typed {len(labels)} lines of text; {int(sum(kind(o) == 'NOTTEXT' for o in owners))} strokes that were not "
-        f"lettering went back into the drawing; {len(result['symbols'])} marker strokes kept on SYMBOLS")
+  back = sum(kind(o) == "NOTTEXT" for o in owners)
+  print(f"Typed {len(labels)} lines of text; of {back} strokes that were not lettering, {back - len(kept_apart)} are "
+        f"now part of the drawing and {len(kept_apart)} stay as traced strokes; "
+        f"{len(result['symbols'])} marker strokes kept on SYMBOLS")
   print(f"Joined: {joins['corners']} corners and {joins['tees']} T-junctions")
   print(f"Saved {prefix}.dxf, {prefix}.svg, {prefix}_overlay.png, {prefix}_text.json, "
         f"{prefix}_text_read.json/.csv and {', '.join(sheets)}")
