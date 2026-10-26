@@ -27,3 +27,8 @@ Tools for turning a scanned, hand-drawn permit plan into a computer drawing.
    `TEXT_CHECK`, puts things that were not lettering (ticks, symbols) back into the
    drawing, and writes `page1_text_read.csv` plus `page1_dimension_check_*.png`: each
    dimension string next to a crop of the plan, to be checked by a person.
+
+4. `dxf_to_pdf.py` prints the DXF to a PDF at paper size (1/4" = 1'-0"), with a key, so the
+   result can be looked at without CAD software.
+
+       python dxf_to_pdf.py page1.dxf page1.pdf
