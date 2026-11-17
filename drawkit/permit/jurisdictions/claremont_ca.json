@@ -1,0 +1,10 @@
+{
+  "name": "Claremont", "state": "CA", "zone": "RS 13,000", "project_types": ["adu", "addition"],
+  "sources": [
+    "https://ecode360.com/43834000",
+    "https://ecode360.com/43836866",
+    "https://gocodebook.com/library/us/ca/claremont-zoning/title-16-zoning/chapter-16.312-minor-exception-permits",
+    "https://www.claremontca.gov/City-Services/Housing/Accessory-Housing-Units-ADU",
+    "https://claremontca.gov/files/assets/public/v/1/community-development/documents/planning/adup-application-rev-11123.pdf"
+  ]
+}

@@ -31,6 +31,7 @@ GitHub Actions and attaches the PDFs and DXFs as the `sample-drawing-set` artifa
 | `drawkit/render.py` | Writes a sheet to PDF and DXF (one DXF layer per drawkit layer, real-world inches) |
 | `drawkit/dxf2pdf.py` | Renders a sheet DXF to PDF with the same line weights, so a sheet can be maintained in CAD |
 | `drawkit/forms.py` | Fills a fillable PDF form from a JSON file |
+| `drawkit/permit/` | Rule files, the code reader, intake, compliance check and generated sheets (see below) |
 | `run.py` | The pipeline: build each sheet, merge the set, fill the form, check page size and DXF validity |
 
 ## A project
@@ -79,9 +80,46 @@ sheet.title_strip(sheet.frame(), 'PROJECT', ['ADDRESS'], 'FLOOR PLAN', scale='1/
 - Layers carry meaning and line weight: `WALL-EXT`, `WALL-INT`, `WALL-NEW` on plans; `ELEV`, `ELEV-LT`, `ELEV-XL`
   on elevations; `PL`, `SETBK`, `ESMT`, `ROOF` on site plans; `DIM`, `NOTE`, `FLAG` for annotation.
 
+## From a city's code to a first drawing set
+
+`permit.py` sits on top of the drawing engine. It turns a city's rules into the list of things to ask an owner
+for, checks the answers, and draws a first set.
+
+```bash
+export ANTHROPIC_API_KEY=...                                   # only the read step needs it
+python permit.py read   drawkit/permit/jurisdictions/austin_tx.json --out rules/austin_tx.json
+python permit.py review rules/austin_tx.json                   # see every rule with its quote and link
+python permit.py review rules/austin_tx.json --approve max_lot_coverage --by "Your Name"
+python permit.py intake rules/austin_tx.json --type adu --out intake/     # measurements, photos, documents to collect
+python permit.py check  answers.json rules/austin_tx.json
+python permit.py draw   answers.json rules/austin_tx.json --out build/ && python run.py build/
+```
+
+| Step | What happens |
+|---|---|
+| `read` | Fetches the pages listed for the city and has Claude extract development standards and plan requirements into a rule file. Every rule carries a quote and a link; rules whose quote is not found word for word in the page are flagged. `--dry-run` fetches without calling the model. |
+| `review` | A person approves or drops each rule. The file records who approved it and when. |
+| `intake` | Writes `intake.md` (what to measure, photograph and bring) and an `answers.template.json` to fill in. |
+| `check` | Floor area, lot coverage, setbacks, unit size and height against the approved rules, including any exception the code allows. |
+| `draw` | Writes a project with a cover sheet (scope, code check, areas, the city's plan checklist), a site and roof plan, and a floor plan of the new work. |
+
+`check` and `draw` ignore a rule nobody has approved, unless you pass `--allow-draft`; the sheets then mark those rows.
+Try it without an API key on made-up data:
+
+```bash
+python permit.py draw examples/sample_permit/answers.json examples/sample_permit/rules.json --out build/ && python run.py build/
+```
+
+`drawkit/permit/rules/claremont_ca.json` is a first draft rule file for Claremont, California. None of it has been
+reviewed yet. `drawkit/permit/jurisdictions/` lists the pages to read for Claremont and for Austin, Texas.
+
+What this first version does not do: it does not draw elevations or interior layouts, it models buildings as
+rectangles on a rectangular lot, it does not read photos (they are for the drafter), and the `read` step has
+only been tested with a stand-in for the model, not against the live API.
+
 ## Limits
 
-The engine draws what you give it. It does not check a design against a building or zoning code, and its output
-is not a survey or a stamped drawing.
+The output is not a survey or a stamped drawing. A code check is only as good as the rule file behind it, and a
+rule file is only as good as the person who reviewed it. Building-code and structural requirements are not checked.
 
 Fonts: Liberation Sans, SIL Open Font License 1.1 (see `fonts/`).

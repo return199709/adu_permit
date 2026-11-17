@@ -15,7 +15,16 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Build the sample project and run the checks
         run: python run.py examples/sample_house
+      - name: Permit engine on made-up data (intake, check, draw, build)
+        run: |
+          python permit.py intake examples/sample_permit/rules.json --type adu --out build/intake
+          python permit.py check examples/sample_permit/answers.json examples/sample_permit/rules.json
+          python permit.py draw examples/sample_permit/answers.json examples/sample_permit/rules.json --out build/permit
+          python run.py build/permit
       - uses: actions/upload-artifact@v4
         with:
           name: sample-drawing-set
-          path: examples/sample_house/output/
+          path: |
+            examples/sample_house/output/
+            build/permit/output/
+            build/intake/

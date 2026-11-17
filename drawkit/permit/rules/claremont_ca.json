@@ -1,0 +1,53 @@
+{
+  "jurisdiction": {"name": "Claremont", "state": "CA", "zone": "RS 13,000"},
+  "status": "draft",
+  "extracted": {"by": "Claude, from the pages listed in each rule", "on": "2026-11-16",
+                "note": "Not yet reviewed by a person. Front and interior-side setbacks for this zone were not found on the pages read."},
+  "rules": [
+    {"id": "max_floor_area", "kind": "max_floor_area", "applies_to": ["addition", "new_house"],
+     "params": {"base_sf": 2000, "lot_fraction": 0.15, "cap_sf": 5925, "counts": ["living", "garage", "covered_patio"]},
+     "text": "Floor area of the main house may not exceed 2,000 sq ft plus 15% of net lot area, or 5,925 sq ft, whichever is less. Attached garages, covered patios and stairwells count.",
+     "source": {"title": "RS Single-Family Residential Districts, maximum floor area of main structure", "url": "https://ecode360.com/43834000", "quote": "plus 15 percent of the square footage of the net lot area"},
+     "reviewed": false},
+    {"id": "max_lot_coverage", "kind": "max_lot_coverage", "params": {"fraction": 0.35, "counts": ["living", "garage", "covered_patio", "accessory"]},
+     "text": "Buildings, carports, covered patios and decks more than 3 ft above grade may cover at most 35% of the lot.",
+     "source": {"title": "RS districts, maximum lot coverage", "url": "https://ecode360.com/43834000", "quote": "Calculation shall include all areas of the lot covered by any buildings including carports"},
+     "reviewed": false},
+    {"id": "second_story_share", "kind": "max_second_story_fraction", "params": {"fraction": 0.40},
+     "text": "Second-story floor area may not exceed 40% of the maximum permitted floor area of the main structure.",
+     "source": {"title": "RS districts, second story", "url": "https://ecode360.com/43834000", "quote": ""}, "reviewed": false},
+    {"id": "street_side_setback_reversed_corner", "kind": "setback", "params": {"side": "street_side", "feet": 15},
+     "text": "Street-side setback is 15 ft on a reversed corner lot (10 ft on a standard corner lot).",
+     "source": {"title": "RS districts, minimum setbacks", "url": "https://ecode360.com/43834000", "quote": ""}, "reviewed": false},
+    {"id": "minor_exception_floor_area", "kind": "exception", "params": {"applies_to": "floor_area", "percent": 20, "name": "a Minor Exception Permit"},
+     "text": "A Minor Exception Permit can allow up to 20% more floor area for a main residential structure.",
+     "source": {"title": "Chapter 16.312 Minor Exception Permits, scope", "url": "https://gocodebook.com/library/us/ca/claremont-zoning/title-16-zoning/chapter-16.312-minor-exception-permits", "section": "16.312.010", "quote": ""}, "reviewed": false},
+    {"id": "minor_exception_lot_coverage", "kind": "exception", "params": {"applies_to": "lot_coverage", "percent": 20, "name": "a Minor Exception Permit"},
+     "text": "A Minor Exception Permit can allow up to 20% more lot coverage.",
+     "source": {"title": "Chapter 16.312 Minor Exception Permits, scope", "url": "https://gocodebook.com/library/us/ca/claremont-zoning/title-16-zoning/chapter-16.312-minor-exception-permits", "section": "16.312.010", "quote": ""}, "reviewed": false},
+    {"id": "minor_exception_setback", "kind": "exception", "params": {"applies_to": "setback", "percent": 20, "name": "a Minor Exception Permit"},
+     "text": "A Minor Exception Permit can reduce a required setback by up to 20%.",
+     "source": {"title": "Chapter 16.312 Minor Exception Permits, scope", "url": "https://gocodebook.com/library/us/ca/claremont-zoning/title-16-zoning/chapter-16.312-minor-exception-permits", "section": "16.312.010", "quote": ""}, "reviewed": false},
+    {"id": "exception_process", "kind": "note", "params": {},
+     "text": "Minor Exception Permits are decided by staff after owners within 300 ft are notified; four findings are required, including special circumstances of the property.",
+     "source": {"title": "Chapter 16.312 Minor Exception Permits", "url": "https://gocodebook.com/library/us/ca/claremont-zoning/title-16-zoning/chapter-16.312-minor-exception-permits", "section": "16.312.030-040", "quote": ""}, "reviewed": false}
+  ],
+  "submittal": [
+    {"id": "title_sheet_info", "sheet": "title sheet", "text": "Scope of work and general property information such as zoning and lot size.", "source": {"title": "Planning Division plan-check practice", "url": "", "quote": ""}, "reviewed": false},
+    {"id": "property_lines", "sheet": "site plan", "text": "Property lines drawn accurately, with the distance from the addition to the setback.", "source": {"title": "Planning Division plan-check practice", "url": "", "quote": ""}, "reviewed": false},
+    {"id": "row_and_easements", "sheet": "site plan", "text": "Property line, right-of-way line, recorded easements and a correct north arrow.", "source": {"title": "Engineering Division plan-check practice", "url": "", "quote": ""}, "reviewed": false},
+    {"id": "sewer_poc", "sheet": "site plan", "text": "Sewer point of connection for any new bathroom.", "source": {"title": "Engineering Division plan-check practice", "url": "", "quote": ""}, "reviewed": false},
+    {"id": "drainage", "sheet": "site plan", "text": "Drainage notes and flow lines showing drainage away from the new work.", "source": {"title": "Engineering Division plan-check practice", "url": "", "quote": ""}, "reviewed": false},
+    {"id": "area_calcs", "sheet": "title sheet", "text": "Floor area and lot coverage calculations for the existing house and any accessory structures.", "source": {"title": "Planning Division plan-check practice", "url": "", "quote": ""}, "reviewed": false},
+    {"id": "elevations_match", "sheet": "elevations", "text": "Elevations showing that the new work matches the existing house.", "source": {"title": "Planning Division plan-check practice", "url": "", "quote": ""}, "reviewed": false},
+    {"id": "roof_plan", "sheet": "roof plan", "text": "Roof plan showing the new roof with the existing.", "source": {"title": "Planning Division plan-check practice", "url": "", "quote": ""}, "reviewed": false},
+    {"id": "window_door_schedule", "sheet": "schedule", "text": "Window and door schedule with dimensions, material, finish and colour.", "source": {"title": "Planning Division plan-check practice", "url": "", "quote": ""}, "reviewed": false},
+    {"id": "outside_dimensions", "sheet": "floor plan", "text": "Dimensions outside wall to outside wall, at an accurate scale, for each story.", "source": {"title": "Planning Division plan-check practice", "url": "", "quote": ""}, "reviewed": false},
+    {"id": "grading_application", "sheet": "form", "text": "Residential Grading / On-site Improvements Permit Application.", "source": {"title": "Engineering Division", "url": "", "quote": ""}, "reviewed": false}
+  ],
+  "open_questions": [
+    "Front, rear and interior-side setbacks for this zone: the page read gives only street-side setbacks and refers to Chapter 16.130.",
+    "Where the property line sits relative to the curb on each street.",
+    "Accessory dwelling unit standards (Chapter 16.333) have not been extracted yet."
+  ]
+}

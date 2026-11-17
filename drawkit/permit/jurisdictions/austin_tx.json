@@ -1,0 +1,8 @@
+{
+  "name": "Austin", "state": "TX", "zone": "SF-3", "project_types": ["adu", "addition"],
+  "sources": [
+    "https://www.austintexas.gov/development-services/home-amendments",
+    "https://www.austintexas.gov/development-services/additional-dwelling-units",
+    "https://www.austintexas.gov/page/adu"
+  ]
+}

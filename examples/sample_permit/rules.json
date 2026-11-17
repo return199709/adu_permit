@@ -1,0 +1,24 @@
+{
+  "jurisdiction": {"name": "Anytown", "state": "XX", "zone": "R-1"},
+  "status": "reviewed",
+  "rules": [
+    {"id": "max_floor_area", "kind": "max_floor_area", "params": {"base_sf": 1500, "lot_fraction": 0.2, "counts": ["living", "garage", "covered_patio"]},
+     "text": "Made-up rule: floor area may not exceed 1,500 sq ft plus 20% of lot area.", "source": {"title": "Invented for the example", "url": "", "quote": ""}, "reviewed": true, "reviewed_by": "example", "reviewed_on": "2026-01-01"},
+    {"id": "max_lot_coverage", "kind": "max_lot_coverage", "params": {"fraction": 0.4}, "text": "Made-up rule: roofed structures may cover 40% of the lot.", "source": {"title": "Invented for the example", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "front_setback", "kind": "setback", "params": {"side": "front", "feet": 20}, "text": "Made-up rule: 20 ft front setback.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "street_side_setback", "kind": "setback", "params": {"side": "street_side", "feet": 10}, "text": "Made-up rule: 10 ft street-side setback.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "rear_setback", "kind": "setback", "params": {"side": "rear", "feet": 5}, "text": "Made-up rule: 5 ft rear setback.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "side_setback", "kind": "setback", "params": {"side": "interior_side", "feet": 5}, "text": "Made-up rule: 5 ft interior-side setback.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "adu_size", "kind": "max_unit_size", "applies_to": ["adu"], "params": {"sf": 800}, "text": "Made-up rule: an ADU may be up to 800 sq ft.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "adu_height", "kind": "max_height", "applies_to": ["adu"], "params": {"feet": 16}, "text": "Made-up rule: an ADU may be up to 16 ft high.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "small_exception", "kind": "exception", "params": {"applies_to": "floor_area", "percent": 10, "name": "an administrative exception"}, "text": "Made-up rule: staff may allow 10% more floor area.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true}
+  ],
+  "submittal": [
+    {"id": "title_info", "sheet": "title sheet", "text": "Scope of work, zoning and lot size.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "site", "sheet": "site plan", "text": "Property lines, setbacks, and the distance from the new work to each lot line.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "sewer", "sheet": "site plan", "text": "Sewer point of connection for a new bathroom.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "plan", "sheet": "floor plan", "text": "Dimensions outside wall to outside wall.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true},
+    {"id": "elev", "sheet": "elevations", "text": "All four elevations of the new work.", "source": {"title": "Invented", "url": "", "quote": ""}, "reviewed": true}
+  ],
+  "open_questions": []
+}

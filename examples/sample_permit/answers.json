@@ -1,0 +1,17 @@
+{
+  "project": {"name": "Sample ADU", "address": ["100 Example Street", "Anytown"], "type": "adu", "zone": "R-1", "date": "2026",
+              "scope": "New detached one-story accessory dwelling unit of 480 square feet with one bathroom, behind the existing single-family house. Every number in this example is invented."},
+  "lot": {"width_ft": 100, "depth_ft": 100, "area_sf": null, "corner_radius_ft": 15, "front": "east", "street_side": "south",
+          "streets": {"east": "First Street", "south": "Oak Lane"}},
+  "existing": {
+    "wings": [{"name": "House", "x": 30, "y": 12, "w": 44, "d": 26, "plate_ft": 9, "counts_as": "living"},
+              {"name": "Garage", "x": 52, "y": 38, "w": 22, "d": 22, "plate_ft": 9, "counts_as": "garage"}],
+    "other_areas": [{"name": "Covered patio", "sf": 120, "counts_as": "covered_patio"}],
+    "second_floor_sf": 0},
+  "new": {"name": "ADU", "x": 8, "y": 62, "w": 24, "d": 20, "plate_ft": 9, "height_ft": 14, "counts_as": "living",
+          "openings": [{"wall": "east", "type": "door", "offset": 4, "width": 3}, {"wall": "east", "type": "window", "offset": 11, "width": 5},
+                       {"wall": "south", "type": "window", "offset": 4, "width": 6}, {"wall": "north", "type": "window", "offset": 16, "width": 3},
+                       {"wall": "west", "type": "window", "offset": 8, "width": 4}],
+          "rooms": [{"name": "Studio", "x": 12, "y": 9}]},
+  "utilities": {"sewer_poc": {"x": 46, "y": 70}}
+}
